@@ -16,6 +16,7 @@
 #define KAFKA_ERR_NO_DATA "no_message\n"
 #define KAFKA_ERR_BODY_TO_LARGE "body_too_large\n"
 #define KAFKA_ERR_PRODUCER "kafka_producer_error\n"
+#define KAFKA_OK_PRODUCER "ok\n"
 
 #define KAFKA_PARTITION_UNSET 0xFFFFFFFF
 
@@ -37,6 +38,7 @@ static char *ngx_http_set_kafka_broker(ngx_conf_t *cf,
         ngx_command_t *cmd, void *conf);
 static ngx_int_t ngx_http_kafka_handler(ngx_http_request_t *r);
 static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r);
+static void ngx_http_kafka_get_callback_handler(ngx_http_request_t *r);
 
 typedef enum {
     ngx_str_push = 0,
@@ -337,25 +339,149 @@ char *ngx_http_set_kafka_broker(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 static ngx_int_t ngx_http_kafka_handler(ngx_http_request_t *r)
 {
     ngx_int_t  rv;
-
-    if (!(r->method & NGX_HTTP_POST)) {
-        return NGX_HTTP_NOT_ALLOWED;
-    }
-
-    rv = ngx_http_read_client_request_body(r, ngx_http_kafka_post_callback_handler);
-    if (rv >= NGX_HTTP_SPECIAL_RESPONSE) {
-        return rv;
-    }
-
-    return NGX_DONE;
+   if (r->method & NGX_HTTP_POST) {
+        rv = ngx_http_read_client_request_body(r, ngx_http_kafka_post_callback_handler);
+        if (rv >= NGX_HTTP_SPECIAL_RESPONSE) {
+            return rv;
+        }
+        return NGX_DONE;
+   } else if (r->method & NGX_HTTP_GET) {
+       ngx_http_kafka_get_callback_handler(r);
+       return NGX_OK;
+   } 
+    return NGX_DECLINED;
 }
 
+static void ngx_http_kafka_get_callback_handler(ngx_http_request_t *r)
+{
+    int                          rc;
+    u_char                      *err_msg, *ok_msg, *k_msg;
+    size_t                      err_msg_size, ok_msg_size, msg_size, n;
+    ngx_log_t                   *conn_log;
+    ngx_buf_t                   *buf;
+    ngx_chain_t                  out;
+    // ngx_chain_t                 *cl, *in;
+    ngx_http_kafka_main_conf_t  *main_conf;
+    ngx_http_kafka_loc_conf_t   *local_conf;
+
+    err_msg = NULL;
+    err_msg_size = 0;
+    ok_msg = NULL;
+    ok_msg_size = 0;
+
+    main_conf = NULL;
+
+    ngx_str_t first = ngx_string("NG-GET ||");
+    ngx_str_t delimit = ngx_string("||");
+
+    msg_size = 0;
+    msg_size += r->method_name.len;
+    msg_size += r->request_line.len;
+    msg_size += r->args.len;
+    msg_size += r->uri.len;
+    msg_size += r->headers_in.host->value.len;
+    msg_size += r->headers_in.user_agent->value.len;
+
+    if ((k_msg = ngx_pnalloc(r->pool, msg_size + 64)) == NULL) {
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    n = 0;
+    ngx_cpystrn(k_msg, first.data, first.len + 1);
+    n += first.len + 1;
+
+    ngx_cpystrn(&k_msg[n], r->method_name.data, r->method_name.len + 1);
+    n += r->method_name.len + 1;
+    ngx_cpystrn(&k_msg[n], delimit.data, delimit.len + 1);
+    n += delimit.len + 1;
+
+    ngx_cpystrn(&k_msg[n], r->request_line.data, r->request_line.len + 1);
+    n += r->request_line.len + 1;
+    ngx_cpystrn(&k_msg[n], delimit.data, delimit.len + 1);
+    n += delimit.len + 1;
+
+    ngx_cpystrn(&k_msg[n], r->args.data, r->args.len + 1);
+    n += r->args.len + 1;
+    ngx_cpystrn(&k_msg[n], delimit.data, delimit.len + 1);
+    n += delimit.len + 1;
+
+    ngx_cpystrn(&k_msg[n], r->uri.data, r->uri.len + 1);
+    n += r->uri.len + 1;
+    ngx_cpystrn(&k_msg[n], delimit.data, delimit.len + 1);
+    n += delimit.len + 1;
+
+    ngx_cpystrn(&k_msg[n], r->headers_in.host->value.data, r->headers_in.host->value.len + 1);
+    n += r->headers_in.host->value.len + 1;
+    ngx_cpystrn(&k_msg[n], delimit.data, delimit.len + 1);
+    n += delimit.len  + 1;
+
+    ngx_cpystrn(&k_msg[n], r->headers_in.user_agent->value.data, r->headers_in.user_agent->value.len + 1);
+    n += r->headers_in.user_agent->value.len + 1;
+    ngx_cpystrn(&k_msg[n], delimit.data, delimit.len + 1);
+    n += delimit.len  + 1;
+
+    ngx_cpystrn(&k_msg[n], ngx_cached_http_time.data, ngx_cached_http_time.len + 1);
+    n += ngx_cached_http_time.len + 1;
+    ngx_cpystrn(&k_msg[n], delimit.data, delimit.len + 1);
+    n += delimit.len  + 1;
+    k_msg[n] = '\0';
+
+    /* send to kafka */
+    main_conf = ngx_http_get_module_main_conf(r, ngx_http_kafka_module);
+    local_conf = ngx_http_get_module_loc_conf(r, ngx_http_kafka_module);
+    if (local_conf->rkt == NULL) {
+        ngx_str_helper(&local_conf->topic, ngx_str_push);
+        local_conf->rkt = rd_kafka_topic_new(main_conf->rk,
+                (const char *)local_conf->topic.data, local_conf->rktc);
+        ngx_str_helper(&local_conf->topic, ngx_str_pop);
+    }
+    conn_log = r->connection->log;
+    rc = rd_kafka_produce(local_conf->rkt, (int32_t)local_conf->partition,
+            RD_KAFKA_MSG_F_COPY, (void *)k_msg, n, NULL, 0, conn_log);
+    if (rc != 0) {
+        ngx_log_error(NGX_LOG_ERR, conn_log, 0,
+                rd_kafka_err2str(rd_kafka_last_error()));
+
+        err_msg = (u_char *)KAFKA_ERR_PRODUCER;
+        err_msg_size = sizeof(KAFKA_ERR_PRODUCER);
+        r->headers_out.status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    buf = ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
+    out.buf = buf;
+    out.next = NULL;
+
+    if (err_msg != NULL) {
+        buf->pos = err_msg;
+        buf->last = err_msg + err_msg_size - 1;
+    } else {
+        ok_msg = (u_char *)KAFKA_OK_PRODUCER;
+        ok_msg_size = sizeof(KAFKA_OK_PRODUCER);
+        buf->pos = ok_msg;
+        buf->last = ok_msg + ok_msg_size - 1;
+    }
+
+    buf->memory = 1;
+    buf->last_buf = 1;
+
+    ngx_str_set(&(r->headers_out.content_type), "text/html");
+    r->headers_out.status = NGX_HTTP_OK;
+    ngx_http_send_header(r);
+    ngx_http_output_filter(r, &out);
+    
+    // ngx_http_finalize_request(r, NGX_OK);
+
+    if (main_conf != NULL) {
+        rd_kafka_poll(main_conf->rk, 0);
+    }
+}
 
 static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r)
 {
     int                          rc, nbufs;
     u_char                      *msg, *err_msg;
-    size_t                       len, err_msg_size;
+    size_t                       len, err_msg_size, pre_len;
     ngx_log_t                   *conn_log;
     ngx_buf_t                   *buf;
     ngx_chain_t                  out;
@@ -364,8 +490,12 @@ static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r)
     ngx_http_kafka_main_conf_t  *main_conf;
     ngx_http_kafka_loc_conf_t   *local_conf;
 
+    ngx_str_t first = ngx_string("NG-POST ||");
+    ngx_str_t delimit = ngx_string("||");
+
     err_msg = NULL;
     err_msg_size = 0;
+    pre_len = 0;
 
     main_conf = NULL;
 
@@ -395,17 +525,24 @@ static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r)
         goto end;
     }
 
-    if (nbufs == 1 && ngx_buf_in_memory(in->buf)) {
+    pre_len += first.len + 1;
+    pre_len += ngx_cached_http_time.len + 1;
+    pre_len += delimit.len + 1;
 
-        msg = in->buf->pos;
+    if ((msg = ngx_pnalloc(r->pool, len + pre_len)) == NULL) {
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    msg = ngx_copy(msg, first.data, first.len + 1);
+    msg = ngx_copy(msg, ngx_cached_http_time.data, ngx_cached_http_time.len + 1);
+    msg = ngx_copy(msg, delimit.data, delimit.len + 1);
+
+    if (nbufs == 1 && ngx_buf_in_memory(in->buf)) {
+        msg = ngx_copy(msg, in->buf->pos, in->buf->last - in->buf->pos);
+        msg -= (len + pre_len);
 
     } else {
-
-        if ((msg = ngx_pnalloc(r->pool, len)) == NULL) {
-            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-            return;
-        }
-
         for (cl = in; cl != NULL; cl = cl->next) {
             if (ngx_buf_in_memory(cl->buf)) {
                 msg = ngx_copy(msg, cl->buf->pos, cl->buf->last - cl->buf->pos);
@@ -421,7 +558,7 @@ static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r)
                 goto end;
             }
         }
-        msg -= len;
+        msg -= (len + pre_len);
 
     }
 
@@ -450,7 +587,7 @@ static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r)
      * */
     conn_log = r->connection->log;
     rc = rd_kafka_produce(local_conf->rkt, (int32_t)local_conf->partition,
-            RD_KAFKA_MSG_F_COPY, (void *)msg, len, NULL, 0, conn_log);
+            RD_KAFKA_MSG_F_COPY, (void *)msg, len + pre_len, NULL, 0, conn_log);
     if (rc != 0) {
         ngx_log_error(NGX_LOG_ERR, conn_log, 0,
                 rd_kafka_err2str(rd_kafka_last_error()));
