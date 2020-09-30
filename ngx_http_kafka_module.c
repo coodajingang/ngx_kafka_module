@@ -19,6 +19,7 @@
 #define KAFKA_OK_PRODUCER "ok\n"
 
 #define KAFKA_PARTITION_UNSET 0xFFFFFFFF
+#define RD_KAFKA_CONF_OK 0
 
 static ngx_int_t ngx_http_kafka_init_worker(ngx_cycle_t *cycle);
 static void ngx_http_kafka_exit_worker(ngx_cycle_t *cycle);
@@ -40,6 +41,17 @@ static ngx_int_t ngx_http_kafka_handler(ngx_http_request_t *r);
 static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r);
 static void ngx_http_kafka_get_callback_handler(ngx_http_request_t *r);
 
+static char *ngx_http_set_kafka_security_protocol(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf);
+static char *ngx_http_set_kafka_sasl_mechanisms(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf);
+static char *ngx_http_set_kafka_sasl_username(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf);
+static char *ngx_http_set_kafka_sasl_password(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf);
+static char *ngx_http_set_kafka_sasl_switch(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf);
+
 typedef enum {
     ngx_str_push = 0,
     ngx_str_pop = 1
@@ -51,6 +63,11 @@ typedef struct {
     rd_kafka_t       *rk;
     rd_kafka_conf_t  *rkc;
     ngx_array_t      *broker_list;
+    ngx_str_t        protocol;
+    ngx_str_t        mechanisms;
+    ngx_str_t        username;
+    ngx_str_t        password;
+    ngx_str_t        saslswitch;
 } ngx_http_kafka_main_conf_t;
 
 static char *ngx_http_kafka_main_conf_broker_add(ngx_http_kafka_main_conf_t *cf,
@@ -82,6 +99,41 @@ static ngx_command_t ngx_http_kafka_commands[] = {
         ngx_http_set_kafka_broker_list,
         NGX_HTTP_MAIN_CONF_OFFSET,
         0,
+        NULL },
+    {
+        ngx_string("kafka_security_protocol"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_http_set_kafka_security_protocol,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_kafka_main_conf_t, protocol),
+        NULL },
+    {
+        ngx_string("kafka_sasl_mechanisms"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_http_set_kafka_sasl_mechanisms,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_kafka_main_conf_t, mechanisms),
+        NULL },
+    {
+        ngx_string("kafka_sasl_username"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_http_set_kafka_sasl_username,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_kafka_main_conf_t, username),
+        NULL },
+    {
+        ngx_string("kafka_sasl_password"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_http_set_kafka_sasl_password,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_kafka_main_conf_t, password),
+        NULL },
+    {
+        ngx_string("kafka_sasl_switch"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_http_set_kafka_sasl_switch,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_kafka_main_conf_t, saslswitch),
         NULL },
     {
         ngx_string("kafka_topic"),
@@ -257,6 +309,46 @@ char *ngx_http_set_kafka_broker_list(ngx_conf_t *cf,
     return NGX_OK;
 }
 
+char *ngx_http_set_kafka_security_protocol(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf)
+{
+    ngx_http_kafka_main_conf_t* main_conf;
+    main_conf = conf;
+    char* rv = ngx_conf_set_str_slot(cf, cmd, conf);
+    return rv;
+}
+char *ngx_http_set_kafka_sasl_mechanisms(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf)
+{
+    ngx_http_kafka_main_conf_t* main_conf;
+    main_conf = conf;
+    char* rv = ngx_conf_set_str_slot(cf, cmd, conf);
+    return rv;
+}
+char *ngx_http_set_kafka_sasl_username(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf)
+{
+    ngx_http_kafka_main_conf_t* main_conf;
+    main_conf = conf;
+    char* rv = ngx_conf_set_str_slot(cf, cmd, conf);
+    return rv;
+}
+char *ngx_http_set_kafka_sasl_password(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf)
+{
+    ngx_http_kafka_main_conf_t* main_conf;
+    main_conf = conf;
+    char* rv = ngx_conf_set_str_slot(cf, cmd, conf);
+    return rv;
+}
+char *ngx_http_set_kafka_sasl_switch(ngx_conf_t *cf,
+        ngx_command_t *cmd, void *conf)
+{
+    ngx_http_kafka_main_conf_t* main_conf;
+    main_conf = conf;
+    char* rv = ngx_conf_set_str_slot(cf, cmd, conf);
+    return rv;
+}
 
 char *ngx_http_set_kafka_topic(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -490,8 +582,8 @@ static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r)
     ngx_http_kafka_main_conf_t  *main_conf;
     ngx_http_kafka_loc_conf_t   *local_conf;
 
-    ngx_str_t first = ngx_string("NG-POST ||");
-    ngx_str_t delimit = ngx_string("||");
+    // ngx_str_t first = ngx_string("NG-POST ||");
+    // ngx_str_t delimit = ngx_string("||");
 
     err_msg = NULL;
     err_msg_size = 0;
@@ -525,24 +617,28 @@ static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r)
         goto end;
     }
 
-    pre_len += first.len + 1;
-    pre_len += ngx_cached_http_time.len + 1;
-    pre_len += delimit.len + 1;
+    // pre_len += first.len + 1;
+    // pre_len += ngx_cached_http_time.len + 1;
+    // pre_len += delimit.len + 1;
 
-    if ((msg = ngx_pnalloc(r->pool, len + pre_len)) == NULL) {
-        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
-        return;
-    }
+    // if ((msg = ngx_pnalloc(r->pool, len + pre_len)) == NULL) {
+    //     ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+    //     return;
+    // }
 
-    msg = ngx_copy(msg, first.data, first.len + 1);
-    msg = ngx_copy(msg, ngx_cached_http_time.data, ngx_cached_http_time.len + 1);
-    msg = ngx_copy(msg, delimit.data, delimit.len + 1);
+    // msg = ngx_copy(msg, first.data, first.len + 1);
+    // msg = ngx_copy(msg, ngx_cached_http_time.data, ngx_cached_http_time.len + 1);
+    // msg = ngx_copy(msg, delimit.data, delimit.len + 1);
 
     if (nbufs == 1 && ngx_buf_in_memory(in->buf)) {
-        msg = ngx_copy(msg, in->buf->pos, in->buf->last - in->buf->pos);
-        msg -= (len + pre_len);
-
+        //msg = ngx_copy(msg, in->buf->pos, in->buf->last - in->buf->pos);
+        // msg -= (len + pre_len);
+        msg = in->buf->pos;
     } else {
+        if ((msg = ngx_pnalloc(r->pool, len)) == NULL) {
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+            return;
+        }
         for (cl = in; cl != NULL; cl = cl->next) {
             if (ngx_buf_in_memory(cl->buf)) {
                 msg = ngx_copy(msg, cl->buf->pos, cl->buf->last - cl->buf->pos);
@@ -558,7 +654,7 @@ static void ngx_http_kafka_post_callback_handler(ngx_http_request_t *r)
                 goto end;
             }
         }
-        msg -= (len + pre_len);
+        msg -= len;
 
     }
 
@@ -629,13 +725,51 @@ ngx_int_t ngx_http_kafka_init_worker(ngx_cycle_t *cycle)
     ngx_uint_t                   n;
     ngx_str_t                   *broker_list;
     ngx_http_kafka_main_conf_t  *main_conf;
+    rd_kafka_conf_res_t res;
+    char errstr[512];
+    ngx_log_t     *log;
+
+    log = cycle->log;
 
     main_conf = ngx_http_cycle_get_module_main_conf(cycle,
             ngx_http_kafka_module);
     main_conf->rkc = rd_kafka_conf_new();
-    rd_kafka_conf_set_dr_cb(main_conf->rkc, kafka_callback_handler);
-    main_conf->rk = rd_kafka_new(RD_KAFKA_PRODUCER, main_conf->rkc, NULL, 0);
 
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, log, 0, "Start init KAFA ...");
+
+    if (main_conf->saslswitch.len == 2)
+    {
+        res = rd_kafka_conf_set(main_conf->rkc, "security.protocol", (const char *)main_conf->protocol.data, errstr, sizeof(errstr));
+        if (res != RD_KAFKA_CONF_OK) {
+            ngx_log_error(NGX_LOG_EMERG, log, 0, "Error config security.protocol :%s", errstr);
+        }
+        res = rd_kafka_conf_set(main_conf->rkc, "sasl.mechanisms", (const char *)main_conf->mechanisms.data, errstr, sizeof(errstr));
+        if (res != RD_KAFKA_CONF_OK) {
+            ngx_log_error(NGX_LOG_EMERG, log, 0, "Error config sasl.mechanisms :%s", errstr);
+        }
+        res = rd_kafka_conf_set(main_conf->rkc, "sasl.username", (const char *)main_conf->username.data, errstr, sizeof(errstr));
+        if (res != RD_KAFKA_CONF_OK) {
+            ngx_log_error(NGX_LOG_EMERG, log, 0, "Error config sasl.username :%s", errstr);
+        }
+        res = rd_kafka_conf_set(main_conf->rkc, "sasl.password", (const char *)main_conf->password.data, errstr, sizeof(errstr));
+        if (res != RD_KAFKA_CONF_OK) {
+            ngx_log_error(NGX_LOG_EMERG, log, 0, "Error config sasl.password :%s", errstr);
+        }
+        res = rd_kafka_conf_set(main_conf->rkc, "compression.type", "lz4", errstr, sizeof(errstr));
+        if (res != RD_KAFKA_CONF_OK) {
+            ngx_log_error(NGX_LOG_EMERG, log, 0, "Error config compression.type :%s", errstr);
+        }
+    }
+
+    rd_kafka_conf_set_dr_cb(main_conf->rkc, kafka_callback_handler);
+
+    main_conf->rk = rd_kafka_new(RD_KAFKA_PRODUCER, main_conf->rkc, errstr, sizeof(errstr));
+
+    if (!main_conf->rk) {
+        rd_kafka_conf_destroy(main_conf->rkc);
+        ngx_log_error(NGX_LOG_EMERG, log, 0, "Failed to create producer: %s\n", errstr);
+        return NGX_ERROR;
+    }
     broker_list = main_conf->broker_list->elts;
 
     for (n = 0; n < main_conf->broker_list->nelts; ++n) {
@@ -643,6 +777,8 @@ ngx_int_t ngx_http_kafka_init_worker(ngx_cycle_t *cycle)
         rd_kafka_brokers_add(main_conf->rk, (const char *)broker_list[n].data);
         ngx_str_helper(&broker_list[n], ngx_str_pop);
     }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_CORE, log, 0, "Complete init KAFA ...");
 
     return 0;
 }
